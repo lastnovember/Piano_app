@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import platform
 import sys
 import threading
 import time
@@ -38,7 +39,9 @@ import time
 import numpy as np
 
 SAMPLE_RATE = 44100
-BLOCK_SIZE = 256          # ~5.8 ms of latency at 44.1 kHz
+# Windows' default audio path (MME / HDMI) needs bigger chunks to avoid
+# "output underflow" crackles; 1024 samples is ~23 ms, still fine to play on.
+BLOCK_SIZE = 1024 if platform.system() == "Windows" else 256
 MAX_VOICES = 32
 MAX_PARTIALS = 12
 
