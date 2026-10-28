@@ -18,7 +18,8 @@ That is it. With no arguments it:
 
 1. finds your MIDI inputs and auto-selects the M-Audio keyboard,
 2. uses your system's default audio output,
-3. starts the built-in piano synth. Play, Ctrl-C to quit.
+3. plays a piano SoundFont if one sits next to the script (see below), or the
+   built-in synth otherwise. Play, Ctrl-C to quit.
 
 Try `python midi_piano.py --demo` first if you want to hear a test chord without
 touching the keyboard.
@@ -31,20 +32,31 @@ python midi_piano.py --midi 1 --output 3 # pick by index...
 python midi_piano.py --output "Headphones" # ...or by name
 ```
 
-## Better piano sound (optional)
+## Real piano sound (recommended)
 
-The built-in synth needs no extra files. For a sampled grand piano, install
-FluidSynth and point the script at a SoundFont:
+The built-in synth needs no extra files, but it sounds like a synth. For a real
+piano, give the app a piano **SoundFont** (`.sf2`): a file of recorded piano
+samples. The app plays SoundFonts itself; nothing else to install.
 
-```bash
-pip install pyfluidsynth       # also needs the fluidsynth library:
-                               #   macOS: brew install fluid-synth
-                               #   Ubuntu: sudo apt install fluidsynth
-python midi_piano.py --sf2 /path/to/piano.sf2
-```
+1. Download a free piano SoundFont. Good ones under a Creative Commons licence:
+   - FreePats "YDP Grand Piano" (Yamaha Disklavier, ~36 MB) and "Upright Piano
+     KW" from https://freepats.zenvoid.org/Piano/acoustic-grand-piano.html
+     (pick the **SF2** download on that page)
+   - Anything tagged "piano" and "sf2" on https://musical-artifacts.com
+2. Put the `.sf2` file in this folder, next to `midi_piano.py`. If the download
+   is a `.zip` or `.tar.bz2`, you can hand it straight to the app once and it
+   will unpack the `.sf2` here for you:
 
-Free piano SoundFonts: "Salamander Grand" (sf2 conversion), "FluidR3_GM.sf2"
-(program 0 is an acoustic grand piano).
+   ```bash
+   python midi_piano.py --sf2 "C:\Users\you\Downloads\YDP-GrandPiano-SF2-20160804.tar.bz2"
+   ```
+
+3. Run `python midi_piano.py` as usual. The startup line will say
+   `Engine: SoundFont 'Grand Piano' from ...` instead of "built-in synth".
+
+A SoundFont can hold many instruments. `python midi_piano.py --presets` lists
+them; `--program N` (and `--bank N`) picks one. Program 0 is the grand piano in
+General MIDI collections such as `FluidR3_GM.sf2` or `TimGM6mb.sf2`.
 
 ## Supported MIDI
 
@@ -68,10 +80,13 @@ Free piano SoundFonts: "Salamander Grand" (sf2 conversion), "FluidR3_GM.sf2"
 --list          list MIDI inputs and audio outputs, then exit
 --midi X        MIDI input index or name substring
 --output X      audio output index or name substring
---sf2 FILE      SoundFont piano via FluidSynth
---program N     SoundFont program (default 0)
+--sf2 FILE      piano SoundFont (.sf2, or a .zip/.tar download holding one);
+                default: any .sf2 next to the script
+--presets       list the instruments inside the SoundFont, then exit
+--program N     SoundFont program (default 0 = grand piano)
+--bank N        SoundFont bank (default 0)
 --gain G        master gain (default 1.0)
---blocksize N   audio block size (default 256)
+--blocksize N   audio block size (default 1024 on Windows, 256 elsewhere)
 --bend-range S  pitch bend range in semitones (default 2)
 --demo          play a test chord and exit
 --verbose       print each note as it is played
