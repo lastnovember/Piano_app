@@ -39,9 +39,7 @@ import time
 import numpy as np
 
 SAMPLE_RATE = 44100
-# Windows' default audio path (MME / HDMI) needs bigger chunks to avoid
-# "output underflow" crackles; 1024 samples is ~23 ms, still fine to play on.
-BLOCK_SIZE = 1024 if platform.system() == "Windows" else 256
+BLOCK_SIZE = 256          # ~5.8 ms per block; Windows MME gets a bigger one, see default_blocksize()
 MAX_VOICES = 32
 MAX_PARTIALS = 12
 
@@ -707,17 +705,95 @@ def pick_midi_input(names: list[str], requested: str | None) -> str:
     return names[int(choice)]
 
 
-def pick_output_device(requested: str | None):
+def pick_output_device(requested: str | None) -> int:
     import sounddevice as sd
 
     if requested is None:
-        return None                              # system default
-    if requested.isdigit():
-        return int(requested)
-    for i, dev in enumerate(sd.query_devices()):
-        if dev["max_output_channels"] > 0 and requested.lower() in dev["name"].lower():
-            return i
-    raise SystemExit(f"No audio output matches {requested!r}. Run --list to see the options.")
+        device = sd.default.device[1]           # system default
+    elif requested.isdigit():
+        device = int(requested)
+    else:
+        device = None
+        for i, dev in enumerate(sd.query_devices()):
+            if dev["max_output_channels"] > 0 and requested.lower() in dev["name"].lower():
+                device = i
+                break
+        if device is None:
+            raise SystemExit(f"No audio output matches {requested!r}. Run --list to see the options.")
+    return prefer_low_latency_api(device)
+
+
+def hostapi_name(device: int) -> str:
+    import sounddevice as sd
+    return sd.query_hostapis(sd.query_devices(device)["hostapi"])["name"]
+
+
+def prefer_low_latency_api(device: int) -> int:
+    """On Windows the default route (MME) buffers hundreds of milliseconds.
+    If the same output also exists under WASAPI, use that one instead."""
+    import sounddevice as sd
+
+    if platform.system() != "Windows":
+        return device
+    try:
+        chosen = sd.query_devices(device)
+        if "WASAPI" in hostapi_name(device):
+            return device
+        want = chosen["name"].strip()
+        for api in sd.query_hostapis():
+            if "WASAPI" not in api["name"]:
+                continue
+            for i in api["devices"]:
+                dev = sd.query_devices(i)
+                # MME truncates names to 31 chars, so compare on the prefix.
+                if dev["max_output_channels"] > 0 and dev["name"].strip().startswith(want):
+                    return i
+    except Exception:                            # pragma: no cover - environment dependent
+        pass
+    return device
+
+
+def default_blocksize(device: int) -> int:
+    """Windows' legacy MME route needs big blocks to avoid underflow crackles;
+    WASAPI (and macOS / Linux) cope with small ones, which means less delay."""
+    if platform.system() == "Windows" and "WASAPI" not in hostapi_name(device):
+        return 1024
+    return BLOCK_SIZE
+
+
+def stream_settings(device: int, exclusive: bool):
+    """Extra PortAudio settings: WASAPI exclusive mode for the lowest latency."""
+    import sounddevice as sd
+
+    if platform.system() == "Windows" and "WASAPI" in hostapi_name(device):
+        if exclusive:
+            return sd.WasapiSettings(exclusive=True)
+        return sd.WasapiSettings(auto_convert=True)   # device may run at 48 kHz
+    return None
+
+
+def open_output_stream(sd, device: int, blocksize: int, channels: int, exclusive: bool,
+                       callback):
+    """Open the output; if the low-latency route refuses, fall back to the
+    system default route with a safe block size rather than failing."""
+    try:
+        return sd.OutputStream(
+            samplerate=SAMPLE_RATE, blocksize=blocksize, device=device,
+            channels=channels, dtype="float32", latency="low",
+            extra_settings=stream_settings(device, exclusive), callback=callback,
+        ), device, blocksize
+    except Exception as exc:
+        fallback = sd.default.device[1]
+        if fallback == device:
+            raise
+        print(f"Could not open {sd.query_devices(device)['name']} ({hostapi_name(device)}): {exc}",
+              file=sys.stderr)
+        print("Falling back to the system default route.", file=sys.stderr)
+        blocksize = max(blocksize, 1024)
+        return sd.OutputStream(
+            samplerate=SAMPLE_RATE, blocksize=blocksize, device=fallback,
+            channels=channels, dtype="float32", latency="low", callback=callback,
+        ), fallback, blocksize
 
 
 def print_devices() -> None:
@@ -741,8 +817,11 @@ def print_devices() -> None:
         if dev["max_output_channels"] <= 0:
             continue
         flag = "  <- default" if i == default_out else ""
-        print(f"  [{i}] {dev['name']}  ({dev['max_output_channels']} ch, "
+        api = sd.query_hostapis(dev["hostapi"])["name"]
+        print(f"  [{i}] {dev['name']}  ({api}, {dev['max_output_channels']} ch, "
               f"{int(dev['default_samplerate'])} Hz){flag}")
+    if platform.system() == "Windows":
+        print("\nOn Windows, prefer the 'Windows WASAPI' entry for a device: it has far less delay than MME.")
 
 
 # --------------------------------------------------------------------------- #
@@ -808,23 +887,18 @@ def run(args) -> None:
         elif msg.type == "pitchwheel":
             synth.pitch_bend(msg.pitch, args.bend_range)
 
-    stream = sd.OutputStream(
-        samplerate=SAMPLE_RATE,
-        blocksize=args.blocksize,
-        device=device,
-        channels=args.channels,
-        dtype="float32",
-        latency="low",
-        callback=audio_callback,
-    )
+    blocksize = args.blocksize or default_blocksize(device)
+    stream, device, blocksize = open_output_stream(
+        sd, device, blocksize, args.channels, args.exclusive, audio_callback)
 
-    out_name = sd.query_devices(device if device is not None else sd.default.device[1])["name"]
+    out_name = f"{sd.query_devices(device)['name']} ({hostapi_name(device)})"
     engine = synth.label
 
     with stream, mido.open_input(port_name, callback=midi_callback):
         print(f"MIDI in : {port_name}")
         print(f"Audio out: {out_name}")
-        print(f"Engine   : {engine}  ({SAMPLE_RATE} Hz, {args.blocksize}-sample blocks)")
+        print(f"Engine   : {engine}  ({SAMPLE_RATE} Hz, {blocksize}-sample blocks, "
+              f"~{1000 * blocksize / SAMPLE_RATE:.0f} ms buffer)")
         print("Play. Ctrl-C to stop.\n")
         try:
             while True:
@@ -840,8 +914,9 @@ def play_demo(synth, device, channels: int) -> None:
     def audio_callback(outdata, frames, time_info, status):
         fill_output(outdata, synth.render(frames))
 
-    with sd.OutputStream(samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE, device=device,
-                         channels=channels, dtype="float32", callback=audio_callback):
+    stream, _, _ = open_output_stream(sd, device, default_blocksize(device), channels,
+                                      False, audio_callback)
+    with stream:
         print(f"Engine: {synth.label}")
         print("Demo: C major chord...")
         for note in (60, 64, 67, 72):
@@ -866,8 +941,12 @@ def parse_args(argv=None):
     p.add_argument("--presets", action="store_true", help="list the presets in the SoundFont, then exit")
     p.add_argument("--gain", type=float, default=1.0, help="master gain (default 1.0)")
     p.add_argument("--channels", type=int, default=2, help="output channels (default 2)")
-    p.add_argument("--blocksize", type=int, default=BLOCK_SIZE,
-                   help=f"audio block size; raise it if you hear crackling (default {BLOCK_SIZE})")
+    p.add_argument("--blocksize", type=int, default=0,
+                   help="audio block size; smaller = less delay, bigger = fewer crackles "
+                        "(default: 256, or 1024 on Windows MME)")
+    p.add_argument("--exclusive", action="store_true",
+                   help="Windows: take the output device exclusively (WASAPI) for the lowest delay; "
+                        "other apps go silent while playing")
     p.add_argument("--bend-range", type=float, default=2.0, help="pitch bend range in semitones")
     p.add_argument("--demo", action="store_true", help="play a test chord and exit")
     p.add_argument("--verbose", action="store_true", help="print each note as it is played")

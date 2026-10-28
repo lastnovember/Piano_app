@@ -70,6 +70,7 @@ General MIDI collections such as `FluidR3_GM.sf2` or `TimGM6mb.sf2`.
 |---|---|
 | "No MIDI inputs found" | Check the USB cable and that the keyboard is powered. On Windows install the M-Audio driver if it is not class compliant. |
 | Crackling / dropouts | `--blocksize 512` or `1024`. Close other audio apps. |
+| Delay between key and sound | On Windows the app already picks the low-delay WASAPI route when it exists; `--list` shows which route each output uses. For the least delay add `--exclusive` (other apps go silent while you play). Wired headphones or speakers in the PC's own jack beat monitor/HDMI audio, and Bluetooth always adds ~100 ms or more. |
 | Wrong output device | `--list`, then `--output <index>`. |
 | Too quiet / too loud | `--gain 1.5` / `--gain 0.5`. |
 | Linux permission error on MIDI | Add your user to the `audio` group, or run with `sudo` once to test. |
@@ -86,7 +87,9 @@ General MIDI collections such as `FluidR3_GM.sf2` or `TimGM6mb.sf2`.
 --program N     SoundFont program (default 0 = grand piano)
 --bank N        SoundFont bank (default 0)
 --gain G        master gain (default 1.0)
---blocksize N   audio block size (default 1024 on Windows, 256 elsewhere)
+--blocksize N   audio block size: smaller = less delay, bigger = fewer crackles
+                (default 256, or 1024 on Windows' legacy MME route)
+--exclusive     Windows: open the output exclusively (WASAPI) for the lowest delay
 --bend-range S  pitch bend range in semitones (default 2)
 --demo          play a test chord and exit
 --verbose       print each note as it is played
