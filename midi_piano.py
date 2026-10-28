@@ -665,6 +665,120 @@ def extract_soundfont(archive: str, dest: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Master effects: peaking EQ + convolution reverb, one partitioned convolution
+# --------------------------------------------------------------------------- #
+
+def peaking_eq_ir(sample_rate: int, freq: float, gain_db: float, q: float = 1.0,
+                  length: int = 2048) -> np.ndarray:
+    """Impulse response of an RBJ peaking biquad (minimum phase, so no added delay)."""
+    a_lin = 10.0 ** (gain_db / 40.0)
+    w0 = 2.0 * math.pi * freq / sample_rate
+    alpha = math.sin(w0) / (2.0 * q)
+    b0, b1, b2 = 1 + alpha * a_lin, -2 * math.cos(w0), 1 - alpha * a_lin
+    a0, a1, a2 = 1 + alpha / a_lin, -2 * math.cos(w0), 1 - alpha / a_lin
+    b0, b1, b2, a1, a2 = b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0
+    ir = np.zeros(length)
+    x1 = x2 = y1 = y2 = 0.0
+    for n in range(length):
+        x0 = 1.0 if n == 0 else 0.0
+        y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        ir[n] = y0
+        x2, x1, y2, y1 = x1, x0, y1, y0
+    return ir
+
+
+def reverb_ir(sample_rate: int, seconds: float, predelay: float = 0.02,
+              seed: int = 7) -> np.ndarray:
+    """Synthetic hall: decorrelated noise per channel whose highs die out
+    faster than its lows, energy-normalised. Returns (length, 2)."""
+    rng = np.random.default_rng(seed)
+    n = int(seconds * sample_rate)
+    t = np.arange(n) / sample_rate
+    # Band edges (Hz) and how much faster each band decays than the full T60.
+    bands = [(0, 400, 1.0), (400, 3000, 0.75), (3000, sample_rate / 2, 0.4)]
+    out = np.zeros((n, 2))
+    freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    for ch in range(2):
+        spectrum = np.fft.rfft(rng.standard_normal(n))
+        for lo, hi, speed in bands:
+            mask = (freqs >= lo) & (freqs < hi)
+            band = np.fft.irfft(spectrum * mask, n)
+            out[:, ch] += band * np.exp(-6.91 * t / (seconds * speed))
+    fade = int(0.005 * sample_rate)
+    out[:fade] *= np.linspace(0.0, 1.0, fade)[:, None]
+    out /= math.sqrt(np.sum(out ** 2) / 2.0) or 1.0   # unit energy per channel
+    pre = np.zeros((int(predelay * sample_rate), 2))
+    return np.vstack([pre, out])
+
+
+class Effects:
+    """Uniform partitioned convolution (overlap-save) of a stereo block stream
+    with a per-channel impulse response holding EQ and reverb together."""
+
+    def __init__(self, sample_rate: int, block: int, eq_bands: list[tuple[float, float, float]],
+                 reverb_amount: float, reverb_seconds: float):
+        self.block = block
+        self.enabled = bool(eq_bands) or reverb_amount > 0
+        if not self.enabled:
+            return
+
+        eq = np.array([1.0])
+        for freq, gain_db, q in eq_bands:
+            eq = np.convolve(eq, peaking_eq_ir(sample_rate, freq, gain_db, q))
+        # Drop the negligible tail so the IR stays short when there is no reverb.
+        keep = np.flatnonzero(np.abs(eq) > 1e-6)
+        eq = eq[:keep[-1] + 1] if keep.size else eq[:1]
+
+        wet = np.zeros((1, 2))
+        if reverb_amount > 0:
+            wet = reverb_amount * reverb_ir(sample_rate, reverb_seconds)
+        dry_and_wet = np.zeros((max(1, wet.shape[0]), 2))
+        dry_and_wet[0] += 1.0
+        dry_and_wet += wet
+        ir = np.stack([np.convolve(eq, dry_and_wet[:, ch]) for ch in range(2)], axis=1)
+
+        parts = int(math.ceil(ir.shape[0] / block))
+        padded = np.zeros((parts * block, 2))
+        padded[:ir.shape[0]] = ir
+        self.parts = parts
+        self.spectra = np.stack(
+            [np.fft.rfft(padded[p * block:(p + 1) * block], 2 * block, axis=0)
+             for p in range(parts)]).astype(np.complex64)                 # (P, B+1, 2)
+        self.delay_line = np.zeros_like(self.spectra)
+        self.write = 0
+        self.previous = np.zeros((block, 2), dtype=np.float32)
+        self.order = np.arange(parts)
+
+    def process(self, block: np.ndarray) -> np.ndarray:
+        if not self.enabled:
+            return block
+        if block.shape[0] != self.block:          # stream renegotiated its size
+            return block
+        frame = np.concatenate([self.previous, block])
+        self.previous = block
+        self.delay_line[self.write] = np.fft.rfft(frame, axis=0)
+        taps = (self.write - self.order) % self.parts
+        spectrum = np.einsum("pbc,pbc->bc", self.delay_line[taps], self.spectra)
+        self.write = (self.write + 1) % self.parts
+        out = np.fft.irfft(spectrum, 2 * self.block, axis=0)[self.block:]
+        return np.tanh(out).astype(np.float32)   # soft limiter after the EQ boost
+
+
+def parse_eq(specs: list[str]) -> list[tuple[float, float, float]]:
+    """'500:3' -> +3 dB at 500 Hz (Q 1.0); '500:3:2' sets Q too."""
+    bands = []
+    for spec in specs or []:
+        parts = spec.split(":")
+        try:
+            freq, gain = float(parts[0]), float(parts[1])
+            q = float(parts[2]) if len(parts) > 2 else 1.0
+        except (IndexError, ValueError):
+            raise SystemExit(f"--eq expects FREQ:GAIN_DB[:Q], e.g. 500:3, got {spec!r}")
+        bands.append((freq, gain, q))
+    return bands
+
+
+# --------------------------------------------------------------------------- #
 # Device discovery / selection
 # --------------------------------------------------------------------------- #
 
@@ -865,15 +979,17 @@ def run(args) -> None:
     device = pick_output_device(args.output)
 
     if args.demo:
-        play_demo(synth, device, args.channels)
+        play_demo(synth, device, args.channels, args)
         return
 
     port_name = pick_midi_input(list_midi_inputs(), args.midi)
 
+    fx_holder: list[Effects] = []
+
     def audio_callback(outdata, frames, time_info, status):
         if status:
             print(status, file=sys.stderr)
-        fill_output(outdata, synth.render(frames))
+        fill_output(outdata, fx_holder[0].process(synth.render(frames)))
 
     def midi_callback(msg):
         if msg.type == "note_on":
@@ -890,6 +1006,8 @@ def run(args) -> None:
     blocksize = args.blocksize or default_blocksize(device)
     stream, device, blocksize = open_output_stream(
         sd, device, blocksize, args.channels, args.exclusive, audio_callback)
+    fx_holder.append(Effects(SAMPLE_RATE, blocksize, parse_eq(args.eq),
+                             args.reverb, args.reverb_time))
 
     out_name = f"{sd.query_devices(device)['name']} ({hostapi_name(device)})"
     engine = synth.label
@@ -899,6 +1017,8 @@ def run(args) -> None:
         print(f"Audio out: {out_name}")
         print(f"Engine   : {engine}  ({SAMPLE_RATE} Hz, {blocksize}-sample blocks, "
               f"~{1000 * blocksize / SAMPLE_RATE:.0f} ms buffer)")
+        eq_text = ", ".join(f"{f:g} Hz {g:+g} dB" for f, g, _ in parse_eq(args.eq)) or "flat"
+        print(f"Effects  : reverb {args.reverb:g} ({args.reverb_time:g} s), EQ {eq_text}")
         print("Play. Ctrl-C to stop.\n")
         try:
             while True:
@@ -907,15 +1027,20 @@ def run(args) -> None:
             print("\nStopped.")
 
 
-def play_demo(synth, device, channels: int) -> None:
+def play_demo(synth, device, channels: int, args) -> None:
     """Sanity check for the audio path: a C major chord, no keyboard needed."""
     import sounddevice as sd
 
-    def audio_callback(outdata, frames, time_info, status):
-        fill_output(outdata, synth.render(frames))
+    fx_holder: list[Effects] = []
 
-    stream, _, _ = open_output_stream(sd, device, default_blocksize(device), channels,
-                                      False, audio_callback)
+    def audio_callback(outdata, frames, time_info, status):
+        fill_output(outdata, fx_holder[0].process(synth.render(frames)))
+
+    blocksize = args.blocksize or default_blocksize(device)
+    stream, _, blocksize = open_output_stream(sd, device, blocksize, channels,
+                                              False, audio_callback)
+    fx_holder.append(Effects(SAMPLE_RATE, blocksize, parse_eq(args.eq),
+                             args.reverb, args.reverb_time))
     with stream:
         print(f"Engine: {synth.label}")
         print("Demo: C major chord...")
@@ -929,8 +1054,22 @@ def play_demo(synth, device, channels: int) -> None:
 
 
 def parse_args(argv=None):
+    import os
+    import shlex
+
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    # A settings.txt next to the script holds default flags, one or more per
+    # line (e.g. "--eq 500:3"), so favourites survive without retyping them.
+    settings = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.txt")
+    defaults: list[str] = []
+    if os.path.isfile(settings):
+        with open(settings, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    defaults += shlex.split(line)
+    argv = defaults + (list(argv) if argv is not None else sys.argv[1:])
     p.add_argument("--list", action="store_true", help="list MIDI inputs and audio outputs, then exit")
     p.add_argument("--midi", help="MIDI input index or name substring (default: auto-detect M-Audio)")
     p.add_argument("--output", help="audio output index or name substring (default: system default)")
@@ -948,6 +1087,12 @@ def parse_args(argv=None):
                    help="Windows: take the output device exclusively (WASAPI) for the lowest delay; "
                         "other apps go silent while playing")
     p.add_argument("--bend-range", type=float, default=2.0, help="pitch bend range in semitones")
+    p.add_argument("--reverb", type=float, default=0.35,
+                   help="reverb amount, 0 = dry (default 0.35)")
+    p.add_argument("--reverb-time", type=float, default=1.8,
+                   help="reverb tail length in seconds (default 1.8)")
+    p.add_argument("--eq", action="append", metavar="FREQ:DB[:Q]",
+                   help="boost/cut a band, e.g. --eq 500:3 for +3 dB around 500 Hz; repeatable")
     p.add_argument("--demo", action="store_true", help="play a test chord and exit")
     p.add_argument("--verbose", action="store_true", help="print each note as it is played")
     return p.parse_args(argv)

@@ -58,6 +58,27 @@ A SoundFont can hold many instruments. `python midi_piano.py --presets` lists
 them; `--program N` (and `--bank N`) picks one. Program 0 is the grand piano in
 General MIDI collections such as `FluidR3_GM.sf2` or `TimGM6mb.sf2`.
 
+## Reverb and EQ
+
+A light hall reverb is on by default. Adjust or add tone shaping with:
+
+```bash
+python midi_piano.py --reverb 0.5 --reverb-time 2.5   # bigger room (0 = dry)
+python midi_piano.py --eq 500:3                       # +3 dB around 500 Hz (warmth / body)
+python midi_piano.py --eq 500:3 --eq 3000:-2:2        # repeatable; FREQ:DB[:Q]
+```
+
+To keep your favourite settings without retyping them, create a file called
+`settings.txt` next to `midi_piano.py` with the flags inside, one or more per
+line:
+
+```
+--eq 500:3
+--reverb 0.4
+```
+
+Anything typed on the command line still overrides what is in the file.
+
 ## Supported MIDI
 
 - Note on/off with velocity (louder and brighter the harder you play)
@@ -91,6 +112,9 @@ General MIDI collections such as `FluidR3_GM.sf2` or `TimGM6mb.sf2`.
                 (default 256, or 1024 on Windows' legacy MME route)
 --exclusive     Windows: open the output exclusively (WASAPI) for the lowest delay
 --bend-range S  pitch bend range in semitones (default 2)
+--reverb A      reverb amount, 0 = dry (default 0.35)
+--reverb-time S reverb tail in seconds (default 1.8)
+--eq F:DB[:Q]   boost or cut a band, e.g. 500:3; repeatable
 --demo          play a test chord and exit
 --verbose       print each note as it is played
 ```
