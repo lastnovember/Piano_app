@@ -626,6 +626,11 @@ def find_soundfont(explicit: str | None) -> str | None:
 
     here = os.path.dirname(os.path.abspath(__file__))
     if explicit:
+        if not os.path.isfile(explicit):
+            raise SystemExit(
+                f"SoundFont not found: {explicit}\n"
+                "Check the file name and folder (look in your Downloads folder)."
+            )
         if explicit.lower().endswith(".sf2"):
             return explicit
         return extract_soundfont(explicit, here)
