@@ -1,6 +1,6 @@
 # Default settings for the piano app. One or more flags per line.
 # Lines starting with # are ignored. Edit the numbers to taste.
 
---eq 500:1.5        # +3 dB of body around 500 Hz (use 500:-3 to cut instead)
+--eq 500:1.5        # +1.5 dB of body around 500 Hz (use 500:-3 to cut instead)
 --reverb 0.25       # hall reverb amount, 0 = dry, 1 = drenched
 --reverb-time 1.8   # reverb tail in seconds
